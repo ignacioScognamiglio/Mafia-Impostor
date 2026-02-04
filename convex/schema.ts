@@ -8,6 +8,7 @@ export default defineSchema({
     hostId: v.optional(v.id("players")),
     currentRound: v.number(),
     startTime: v.optional(v.number()),
+    roundEndTime: v.optional(v.number()),
     lastRoundSummary: v.optional(v.string()),
     winner: v.optional(v.union(v.literal("villagers"), v.literal("impostor"))),
   }).index("by_room_code", ["roomCode"]),
@@ -20,6 +21,7 @@ export default defineSchema({
     isHost: v.boolean(),
     role: v.optional(v.union(v.literal("asesino"), v.literal("curandero"), v.literal("detective"), v.literal("aldeano"))),
     status: v.union(v.literal("alive"), v.literal("dead")),
+    readyForNext: v.optional(v.boolean()),
   })
   .index("by_game", ["gameId"])
   .index("by_token", ["tokenIdentifier"])

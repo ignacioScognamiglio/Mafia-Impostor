@@ -66,9 +66,8 @@ export const joinGame = mutation({
       .withIndex("by_room_code", (q) => q.eq("roomCode", args.roomCode.toUpperCase()))
       .first();
 
-    if (!game) throw new Error("Sala no encontrada");
+    if (!game) throw new Error("La sala no existe");
     
-    // Allow re-joining if already in the game (waiting or in progress)
     const existingPlayer = await ctx.db
       .query("players")
       .withIndex("by_game_token", (q) => q.eq("gameId", game._id).eq("tokenIdentifier", identity.tokenIdentifier))
@@ -80,6 +79,13 @@ export const joinGame = mutation({
 
     if (game.status !== "waiting") throw new Error("La partida ya ha comenzado");
 
+    const players = await ctx.db
+      .query("players")
+      .withIndex("by_game", (q) => q.eq("gameId", game._id))
+      .collect();
+
+    if (players.length >= 10) throw new Error("La sala está llena (máximo 10 jugadores)");
+
     const playerId = await ctx.db.insert("players", {
       gameId: game._id,
       tokenIdentifier: identity.tokenIdentifier,
@@ -87,6 +93,7 @@ export const joinGame = mutation({
       avatar: identity.pictureUrl || "",
       isHost: false,
       status: "alive",
+      readyForNext: true, // Ready by default when joining first time
     });
 
     return { gameId: game._id, playerId };
@@ -102,7 +109,6 @@ export const restartGame = mutation({
     const game = await ctx.db.get(args.gameId);
     if (!game) throw new Error("Juego no encontrado");
 
-    // Verify Host
     const player = await ctx.db
       .query("players")
       .withIndex("by_game_token", (q) => q.eq("gameId", args.gameId).eq("tokenIdentifier", identity.tokenIdentifier))
@@ -110,16 +116,16 @@ export const restartGame = mutation({
 
     if (!player || !player.isHost) throw new Error("Solo el anfitrión puede reiniciar");
 
-    // Reset Game
+    // Reset Game to waiting but keep current players
     await ctx.db.patch(args.gameId, {
       status: "waiting",
       currentRound: 0,
       startTime: undefined,
+      roundEndTime: undefined,
       lastRoundSummary: undefined,
       winner: undefined,
     });
 
-    // Reset Players
     const players = await ctx.db
       .query("players")
       .withIndex("by_game", (q) => q.eq("gameId", args.gameId))
@@ -129,20 +135,11 @@ export const restartGame = mutation({
       await ctx.db.patch(p._id, {
         role: undefined,
         status: "alive",
+        readyForNext: p.isHost ? true : false, // Host is ready by default
       });
     }
 
-    // Clean up actions and suspicions (optional but cleaner)
-    // We can't easily delete by index in bulk without iterating, 
-    // but since we filter by game/round, old ones won't affect new game if round resets to 0.
-    // However, round 0 actions/suspicions from previous game might leak if we don't clear them?
-    // Actually, actions are usually round >= 1. Round 0 is setup. 
-    // So keeping them is "okay" as history, but better to clear if we want a fresh start.
-    // For simplicity/speed we'll skip bulk delete (expensive) and rely on round logic. 
-    // Since currentRound resets to 0, and we increment to 1 on start, 
-    // we just need to ensure we don't fetch old round 1 stuff.
-    // But we WILL fetch old round 1 stuff if we don't delete or change game ID.
-    // Ideally we should delete. Let's iterate.
+    // Clean actions
     const actions = await ctx.db
       .query("actions")
       .withIndex("by_game_round", (q) => q.eq("gameId", args.gameId))
@@ -154,6 +151,22 @@ export const restartGame = mutation({
       .withIndex("by_game_round", (q) => q.eq("gameId", args.gameId))
       .collect();
     for (const s of suspicions) await ctx.db.delete(s._id);
+  },
+});
+
+export const acceptNextGame = mutation({
+  args: { gameId: v.id("games") },
+  handler: async (ctx, args) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) throw new Error("No autenticado");
+
+    const player = await ctx.db
+      .query("players")
+      .withIndex("by_game_token", (q) => q.eq("gameId", args.gameId).eq("tokenIdentifier", identity.tokenIdentifier))
+      .unique();
+
+    if (!player) throw new Error("Jugador no encontrado");
+    await ctx.db.patch(player._id, { readyForNext: true });
   },
 });
 
@@ -197,6 +210,13 @@ export const castSuspicion = mutation({
   },
 });
 
+import { mutation, query, internalMutation } from "./_generated/server";
+import { v } from "convex/values";
+import { Id } from "./_generated/dataModel";
+import { internal } from "./_generated/api";
+
+// ... (helpers)
+
 export const startGame = mutation({
   args: { gameId: v.id("games") },
   handler: async (ctx, args) => {
@@ -206,7 +226,6 @@ export const startGame = mutation({
     const game = await ctx.db.get(args.gameId);
     if (!game) throw new Error("Juego no encontrado");
 
-    // Verify Host
     const player = await ctx.db
       .query("players")
       .withIndex("by_game_token", (q) => q.eq("gameId", args.gameId).eq("tokenIdentifier", identity.tokenIdentifier))
@@ -219,11 +238,16 @@ export const startGame = mutation({
       .withIndex("by_game", (q) => q.eq("gameId", args.gameId))
       .collect();
 
-    if (players.length === 0) throw new Error("No hay jugadores");
+    // Check if everyone is ready (if restarting)
+    if (game.status === "waiting" && game.currentRound === 0) {
+      const unready = players.filter(p => !p.readyForNext);
+      if (unready.length > 0) throw new Error("Esperando a que todos acepten jugar");
+    }
 
-    const playerCount = players.length;
+    if (players.length < 3) throw new Error("Se necesitan al menos 3 jugadores");
+
     let roles: string[] = [];
-
+    const playerCount = players.length;
     if (playerCount < 3) {
       roles.push("asesino");
       for (let i = 1; i < playerCount; i++) roles.push("aldeano");
@@ -243,11 +267,19 @@ export const startGame = mutation({
       });
     }
 
+    const roundEndTime = Date.now() + 15000;
     await ctx.db.patch(args.gameId, {
       status: "in_progress",
       currentRound: 1,
       startTime: Date.now(),
-      lastRoundSummary: undefined, // Clear summary on start
+      roundEndTime,
+      lastRoundSummary: undefined,
+    });
+
+    // Schedule resolution
+    await ctx.scheduler.runAt(roundEndTime, internal.games.scheduledResolve, { 
+      gameId: args.gameId, 
+      round: 1 
     });
   },
 });
@@ -265,7 +297,6 @@ export const submitAction = mutation({
     const game = await ctx.db.get(args.gameId);
     if (!game || game.status !== "in_progress") throw new Error("Juego no activo");
 
-    // Identify current player securely
     const player = await ctx.db
       .query("players")
       .withIndex("by_game_token", (q) => q.eq("gameId", args.gameId).eq("tokenIdentifier", identity.tokenIdentifier))
@@ -290,84 +321,26 @@ export const submitAction = mutation({
         actionType: args.actionType,
       });
     }
+  },
+});
 
-    // Check completion
-    const allPlayers = await ctx.db
-      .query("players")
-      .withIndex("by_game", (q) => q.eq("gameId", args.gameId))
-      .collect();
-
-    const activeSpecialPlayers = allPlayers.filter(
-      (p) => p.status === "alive" && p.role !== "aldeano"
-    );
-
-    const currentRoundActions = await ctx.db
-      .query("actions")
-      .withIndex("by_game_round", (q) => q.eq("gameId", args.gameId).eq("round", game.currentRound))
-      .collect();
-
-    if (currentRoundActions.length >= activeSpecialPlayers.length) {
-      await resolveRound(ctx, args.gameId);
-    }
+export const scheduledResolve = internalMutation({
+  args: { gameId: v.id("games"), round: v.number() },
+  handler: async (ctx, args) => {
+    const game = await ctx.db.get(args.gameId);
+    if (!game || game.status !== "in_progress" || game.currentRound !== args.round) return;
+    await resolveRound(ctx, args.gameId);
   },
 });
 
 export const forceEndRound = mutation({
   args: { gameId: v.id("games") },
   handler: async (ctx, args) => {
-    // Ideally verify host here too, but for speed we trust the button visibility logic + game state
     await resolveRound(ctx, args.gameId);
   }
 });
 
-// --- Queries ---
-
-export const getGame = query({
-  args: { roomCode: v.string() },
-  handler: async (ctx, args) => {
-    return await ctx.db
-      .query("games")
-      .withIndex("by_room_code", (q) => q.eq("roomCode", args.roomCode.toUpperCase()))
-      .unique();
-  },
-});
-
-export const getPlayers = query({
-  args: { gameId: v.id("games") },
-  handler: async (ctx, args) => {
-    const players = await ctx.db
-      .query("players")
-      .withIndex("by_game", (q) => q.eq("gameId", args.gameId))
-      .collect();
-    
-    // Determine if current viewer is in the list
-    const identity = await ctx.auth.getUserIdentity();
-    if (!identity) return { players, viewerId: null, suspiciousTargets: [] };
-
-    // Find the player object corresponding to the current user
-    const viewer = players.find(p => p.tokenIdentifier === identity.tokenIdentifier);
-    
-    let suspiciousTargets: Id<"players">[] = [];
-    if (viewer && viewer.role === "detective") {
-        const game = await ctx.db.get(args.gameId);
-        if (game) {
-            const suspicions = await ctx.db
-            .query("suspicions")
-            .withIndex("by_game_round", (q) => q.eq("gameId", args.gameId).eq("round", game.currentRound))
-            .collect();
-            suspiciousTargets = suspicions.map(s => s.targetId);
-        }
-    }
-
-    return { 
-      players, 
-      viewerId: viewer ? viewer._id : null,
-      suspiciousTargets
-    };
-  },
-});
-
-// --- Internal Resolution Logic (Same as before) ---
+// ... (queries)
 
 async function resolveRound(ctx: any, gameId: Id<"games">) {
   const game = await ctx.db.get(gameId);
@@ -410,70 +383,84 @@ async function resolveRound(ctx: any, gameId: Id<"games">) {
     summary += "¡El Curandero salvó a la víctima esta noche! ";
   }
 
-  // 3. Apply Death
+  // 3. Apply Death (Temporarily, to check winner)
   let detectiveDied = false;
+  let killedPlayer: any = null;
   if (victimId) {
-    const victim = players.find((p: any) => p._id === victimId);
-    if (victim) {
-      await ctx.db.patch(victim._id, { status: "dead" });
-      summary += `${victim.name} ha sido ASESINADO. `;
-      if (victim.role === "detective") {
-        detectiveDied = true;
-      }
+    killedPlayer = players.find((p: any) => p._id === victimId);
+    if (killedPlayer && killedPlayer.role === "detective") {
+      detectiveDied = true;
     }
-  } else if (!saved && (!assassin || assassin.status === "dead")) {
-     summary += "Noche tranquila. Nadie murió. ";
   }
 
-  // 4. Detective Logic (Win Condition Only)
+  // 4. Detective Logic
   let assassinDiscovered = false;
   const investigateAction = actions.find((a: any) => a.actionType === "investigate");
   if (investigateAction) {
     const target = players.find((p: any) => p._id === investigateAction.targetId);
     if (target && target.role === "asesino") {
        assassinDiscovered = true;
-       summary += `El Detective investigó a ${target.name} y lo descubrió: ¡ES EL ASESINO! `;
     }
-    // Note: We do NOT reveal the result if they are innocent, to protect identities.
   }
 
-  // 5. Win Conditions
-  // Condition A: Assassin Discovered -> Villagers Win
+  // 5. Tie-break Logic (Detective vs Assassin)
+  if (detectiveDied && assassinDiscovered && !saved) {
+    // Both acted against each other. Who was faster?
+    const killTime = killAction?._creationTime || Infinity;
+    const investigateTime = investigateAction?._creationTime || Infinity;
+
+    if (investigateTime < killTime) {
+      // Detective was faster
+      summary += `¡El Detective fue más rápido y descubrió al Asesino antes de ser atacado! `;
+      detectiveDied = false;
+      victimId = null;
+    } else {
+      // Assassin was faster
+      summary += `El Asesino fue más rápido y eliminó al Detective antes de ser descubierto. `;
+      assassinDiscovered = false;
+    }
+  }
+
+  // Apply final death status
+  if (victimId) {
+    await ctx.db.patch(victimId, { status: "dead" });
+    summary += `${killedPlayer.name} ha sido ASESINADO. `;
+  } else if (!saved && !assassinDiscovered) {
+     summary += "Noche tranquila. Nadie murió. ";
+  }
+
   if (assassinDiscovered) {
+    summary += "¡El Asesino ha sido descubierto! ";
     await ctx.db.patch(gameId, { status: "finished", winner: "villagers", lastRoundSummary: summary });
     return;
   }
 
-  // Condition B: Detective Killed -> Impostor Wins
   if (detectiveDied) {
     summary += "¡El Detective ha muerto! El crimen quedará impune.";
     await ctx.db.patch(gameId, { status: "finished", winner: "impostor", lastRoundSummary: summary });
     return;
   }
 
-  // Condition C: Assassin is Dead (Killed by random chance or voting if we had it, but mostly redundant if discovered logic handles it. Still good to keep)
-  const assassinIsDead = victimId && players.find((p: any) => p._id === victimId)?.role === "asesino";
-  if (assassinIsDead) {
-    await ctx.db.patch(gameId, { status: "finished", winner: "villagers", lastRoundSummary: summary });
-    return;
-  }
-  
-  // Condition D: Few Players Left -> Impostor Wins
-  // Count alive players excluding the victim (already handled by status update effectively, but need to be sure)
-  const alivePlayers = players.filter((p: any) => p.status === "alive" && p._id !== victimId); // victimId is already null if saved
-  // Re-fetch or filter properly based on status updates? 
-  // We just patched the victim status. The 'players' array is stale for the victim.
-  const currentAliveCount = players.filter((p: any) => p.status === "alive" && p._id !== victimId).length;
-
-  if (currentAliveCount <= 2) {
+  // Other win conditions
+  const currentAlivePlayers = players.filter((p: any) => p.status === "alive" && p._id !== victimId);
+  if (currentAlivePlayers.length <= 2) {
      await ctx.db.patch(gameId, { status: "finished", winner: "impostor", lastRoundSummary: summary });
      return;
   }
 
   // Next Round
+  const nextRound = game.currentRound + 1;
+  const nextEndTime = Date.now() + 15000;
   await ctx.db.patch(gameId, {
-    currentRound: game.currentRound + 1,
+    currentRound: nextRound,
     startTime: Date.now(),
+    roundEndTime: nextEndTime,
     lastRoundSummary: summary,
   });
+
+  await ctx.scheduler.runAt(nextEndTime, internal.games.scheduledResolve, { 
+    gameId, 
+    round: nextRound 
+  });
 }
+

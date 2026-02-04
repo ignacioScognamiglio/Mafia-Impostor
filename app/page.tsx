@@ -46,6 +46,7 @@ export default function Home() {
       router.push(`/room/${roomCode.toUpperCase()}`);
     } catch (error: any) {
       toast.error(error.message || "Error al unirse");
+      setRoomCode(""); // Clear input on error
     } finally {
       setLoading(false);
     }

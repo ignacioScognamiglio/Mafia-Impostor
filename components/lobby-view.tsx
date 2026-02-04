@@ -19,16 +19,35 @@ interface LobbyViewProps {
 
 export function LobbyView({ game, players, currentPlayerId }: LobbyViewProps) {
   const startGame = useMutation(api.games.startGame);
-  const isHost = players.find(p => p._id === currentPlayerId)?.isHost;
+  const acceptNextGame = useMutation(api.games.acceptNextGame);
+  
+  const currentPlayer = players.find(p => p._id === currentPlayerId);
+  const isHost = currentPlayer?.isHost;
+  const isReady = currentPlayer?.readyForNext;
+
+  const allReady = players.every(p => p.readyForNext);
 
   const handleStart = async () => {
     try {
-      if (players.length < 3) { // Minimal validation
-         // toast.warning("Se necesitan al menos 3 jugadores"); // Uncomment in prod
+      if (players.length < 3) {
+        toast.warning("Se necesitan al menos 3 jugadores");
+        return;
+      }
+      if (!allReady) {
+        toast.warning("Esperando a que todos acepten");
+        return;
       }
       await startGame({ gameId: game._id });
+    } catch (error: any) {
+      toast.error(error.message || "Error al iniciar la partida");
+    }
+  };
+
+  const handleAccept = async () => {
+    try {
+      await acceptNextGame({ gameId: game._id });
     } catch (error) {
-      toast.error("Error al iniciar la partida");
+      toast.error("Error al aceptar");
     }
   };
 
@@ -44,7 +63,7 @@ export function LobbyView({ game, players, currentPlayerId }: LobbyViewProps) {
              <span className="text-sm text-muted-foreground font-medium">
                Jugadores ({players.length})
              </span>
-             {isHost && <Badge variant="secondary">Eres el Host</Badge>}
+             {isHost && <Badge variant="secondary">Host</Badge>}
           </div>
           
           <ScrollArea className="flex-1 rounded-md border p-4 bg-card/50">
@@ -60,19 +79,28 @@ export function LobbyView({ game, players, currentPlayerId }: LobbyViewProps) {
                     {player.isHost && <Crown className="w-4 h-4 text-yellow-500 fill-yellow-500" />}
                     {player._id === currentPlayerId && <Badge variant="outline" className="text-xs">Tú</Badge>}
                   </div>
+                  {player.readyForNext ? (
+                    <Badge variant="default" className="bg-green-500 hover:bg-green-600">Listo</Badge>
+                  ) : (
+                    <Badge variant="secondary" className="animate-pulse">Esperando</Badge>
+                  )}
                 </div>
               ))}
             </div>
           </ScrollArea>
 
-          <div className="pt-4">
-             {isHost ? (
-               <Button size="lg" className="w-full" onClick={handleStart}>
-                 Comenzar Partida
+          <div className="pt-4 space-y-2">
+             {!isReady ? (
+               <Button size="lg" className="w-full bg-blue-600 hover:bg-blue-700 text-white" onClick={handleAccept}>
+                 Aceptar Jugar de Nuevo
+               </Button>
+             ) : isHost ? (
+               <Button size="lg" className="w-full" onClick={handleStart} disabled={!allReady}>
+                 {allReady ? "Comenzar Partida" : "Esperando jugadores..."}
                </Button>
              ) : (
-               <div className="text-center p-4 bg-muted/50 rounded-lg animate-pulse">
-                 <p className="text-sm font-medium">Esperando al anfitrión...</p>
+               <div className="text-center p-4 bg-muted/50 rounded-lg">
+                 <p className="text-sm font-medium text-green-600">Estás listo. Esperando al host...</p>
                </div>
              )}
           </div>
@@ -81,3 +109,4 @@ export function LobbyView({ game, players, currentPlayerId }: LobbyViewProps) {
     </div>
   );
 }
+
