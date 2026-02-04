@@ -42,3 +42,16 @@ next-env.d.ts
 
 # clerk configuration (can include secrets)
 /.clerk/
+
+# IDE / Editor
+.cursor/
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local development files
+implementation-plan.md
+
+# OS files
+Thumbs.db
